@@ -4,8 +4,9 @@
  * Auth: shared "microsoft" OAuth family (delegated → /me) or app-only
  * (tenantId/clientId/clientSecret + userUpn). See _shared/microsoftAuth.ts.
  * Graph delegated scopes: Calendars.Read for reads, Calendars.ReadWrite for
- * writes. Reads ask only for Calendars.Read, so a connection consented
- * before the write actions existed keeps reading; writes need a re-login.
+ * writes, Calendars.Read.Shared for findMeetingTimes. Each action asks only
+ * for what it needs, so a connection consented before the write actions
+ * existed keeps reading; the newer actions need a re-login.
  */
 import type { ActionContext, RunlinePluginAPI } from "runline";
 import {
@@ -17,10 +18,12 @@ import {
 
 const NAME = "microsoftCalendar";
 const READ_SCOPES = ["https://graph.microsoft.com/Calendars.Read"];
-const SCOPES = [
+const WRITE_SCOPES = [
   ...READ_SCOPES,
   "https://graph.microsoft.com/Calendars.ReadWrite",
 ];
+const SHARED_SCOPES = ["https://graph.microsoft.com/Calendars.Read.Shared"];
+const SCOPES = [...WRITE_SCOPES, ...SHARED_SCOPES];
 type Ctx = ActionContext;
 
 /** A Graph collection answer; items pass through to the caller unchanged. */
@@ -61,6 +64,12 @@ const RESPONSES = ["accept", "decline", "tentativelyAccept"] as const;
 
 const list = (v: string[] | string | undefined) =>
   Array.isArray(v) ? v : v ? [v] : [];
+
+const recipients = (v: string[] | string | undefined) =>
+  list(v).map((address) => ({ emailAddress: { address } }));
+
+/** An OData string literal: single quotes doubled. */
+const literal = (v: string) => `'${v.replace(/'/g, "''")}'`;
 
 /**
  * An ISO time with a zone (`Z` or an offset) is an instant and is sent in
@@ -254,7 +263,9 @@ export default function microsoftCalendar(rl: RunlinePluginAPI): void {
     authUrl: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
     tokenUrl: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
     scopes: [...SCOPES, "offline_access"],
-    setupHelp: microsoftSetupHelp("Calendars.Read and Calendars.ReadWrite"),
+    setupHelp: microsoftSetupHelp(
+      "Calendars.Read, Calendars.ReadWrite and Calendars.Read.Shared",
+    ),
   });
 
   rl.registerAction("calendar.list", {
@@ -373,6 +384,187 @@ export default function microsoftCalendar(rl: RunlinePluginAPI): void {
     },
   });
 
+  rl.registerAction("calendar.findMeetingTimes", {
+    access: "read",
+    description:
+      "Suggest meeting times that fit the attendees' free/busy and working hours. Delegated auth only. Returns {suggestions:[{meetingTimeSlot,confidence,attendeeAvailability,suggestionReason}], emptySuggestionsReason}.",
+    inputSchema: {
+      attendees: {
+        type: "array",
+        required: true,
+        description: "Required attendee address(es)",
+      },
+      optionalAttendees: { type: "array", required: false },
+      start: {
+        type: "string",
+        required: true,
+        description: "Earliest start to consider (ISO)",
+      },
+      end: {
+        type: "string",
+        required: true,
+        description: "Latest end to consider (ISO)",
+      },
+      timeZone: {
+        type: "string",
+        required: false,
+        description:
+          "Zone for start/end without an offset, and for the suggestions (default UTC)",
+      },
+      durationMinutes: { type: "number", required: false, default: 30 },
+      maxCandidates: { type: "number", required: false, default: 5 },
+      activityDomain: {
+        type: "string",
+        required: false,
+        description: "work (working hours, default), personal or unrestricted",
+      },
+      isOrganizerOptional: { type: "boolean", required: false },
+      minimumAttendeePercentage: {
+        type: "number",
+        required: false,
+        description:
+          "Lowest share of attendees (0-100) that must be free for a suggestion",
+      },
+    },
+    async execute(input, ctx: Ctx) {
+      const p = input as {
+        attendees: string[] | string;
+        optionalAttendees?: string[] | string;
+        start: string;
+        end: string;
+        timeZone?: string;
+        durationMinutes?: number;
+        maxCandidates?: number;
+        activityDomain?: string;
+        isOrganizerOptional?: boolean;
+        minimumAttendeePercentage?: number;
+      };
+      const r = await graphRequest<{
+        meetingTimeSuggestions?: unknown[];
+        emptySuggestionsReason?: string;
+      }>(
+        ctx,
+        NAME,
+        SHARED_SCOPES,
+        "POST",
+        `${userBase(ctx)}/findMeetingTimes`,
+        {
+          attendees: [
+            ...recipients(p.attendees).map((a) => ({ ...a, type: "required" })),
+            ...recipients(p.optionalAttendees).map((a) => ({
+              ...a,
+              type: "optional",
+            })),
+          ],
+          timeConstraint: {
+            activityDomain: p.activityDomain ?? "work",
+            timeSlots: [
+              {
+                start: dateTime(p.start, p.timeZone, false),
+                end: dateTime(p.end, p.timeZone, false),
+              },
+            ],
+          },
+          meetingDuration: `PT${p.durationMinutes ?? 30}M`,
+          maxCandidates: p.maxCandidates ?? 5,
+          returnSuggestionReasons: true,
+          ...(p.isOrganizerOptional === undefined
+            ? {}
+            : { isOrganizerOptional: p.isOrganizerOptional }),
+          ...(p.minimumAttendeePercentage === undefined
+            ? {}
+            : { minimumAttendeePercentage: p.minimumAttendeePercentage }),
+        },
+      );
+      return {
+        suggestions: r.meetingTimeSuggestions ?? [],
+        emptySuggestionsReason: r.emptySuggestionsReason || undefined,
+      };
+    },
+  });
+
+  rl.registerAction("event.list", {
+    access: "read",
+    description:
+      "Find events by subject, organizer, category or change time. Recurring events come back as their series, not expanded (use calendar.list for a date range). Returns [{id,subject,start,end,location,organizer,attendees}].",
+    inputSchema: {
+      subject: {
+        type: "string",
+        required: false,
+        description: "Subject contains this text",
+      },
+      organizer: {
+        type: "string",
+        required: false,
+        description: "Organizer email address",
+      },
+      category: { type: "string", required: false },
+      modifiedSince: {
+        type: "string",
+        required: false,
+        description: "Changed at or after this ISO datetime",
+      },
+      filter: {
+        type: "string",
+        required: false,
+        description: "Raw OData $filter, ANDed with the fields above",
+      },
+      orderBy: {
+        type: "string",
+        required: false,
+        description: 'OData $orderby, e.g. "start/dateTime desc"',
+      },
+      top: { type: "number", required: false, default: 50 },
+      calendarId: {
+        type: "string",
+        required: false,
+        description:
+          "A calendar from calendar.listCalendars (default calendar if omitted)",
+      },
+    },
+    async execute(input, ctx: Ctx) {
+      const p = input as {
+        subject?: string;
+        organizer?: string;
+        category?: string;
+        modifiedSince?: string;
+        filter?: string;
+        orderBy?: string;
+        top?: number;
+        calendarId?: string;
+      };
+      const filters: string[] = [];
+      if (p.subject) filters.push(`contains(subject,${literal(p.subject)})`);
+      if (p.organizer)
+        filters.push(
+          `organizer/emailAddress/address eq ${literal(p.organizer)}`,
+        );
+      if (p.category)
+        filters.push(`categories/any(c:c eq ${literal(p.category)})`);
+      if (p.modifiedSince) {
+        const since = new Date(p.modifiedSince);
+        if (Number.isNaN(since.getTime()))
+          throw new Error(`${NAME}: invalid datetime ${p.modifiedSince}`);
+        filters.push(`lastModifiedDateTime ge ${since.toISOString()}`);
+      }
+      if (p.filter) filters.push(`(${p.filter})`);
+      const qs = new URLSearchParams({
+        $top: String(p.top ?? 50),
+        $select: SELECT,
+      });
+      if (filters.length) qs.set("$filter", filters.join(" and "));
+      if (p.orderBy) qs.set("$orderby", p.orderBy);
+      const r = await graphRequest<GraphList>(
+        ctx,
+        NAME,
+        READ_SCOPES,
+        "GET",
+        `${eventsPath(ctx, p.calendarId)}/events?${qs}`,
+      );
+      return r.value;
+    },
+  });
+
   rl.registerAction("event.get", {
     access: "read",
     description: "Get one calendar event by id (full details incl. body).",
@@ -438,7 +630,7 @@ export default function microsoftCalendar(rl: RunlinePluginAPI): void {
       const r = await graphRequest<{ id: string; webLink: string }>(
         ctx,
         NAME,
-        SCOPES,
+        WRITE_SCOPES,
         "POST",
         `${eventsPath(ctx, p.calendarId)}/events`,
         toEvent(p),
@@ -457,7 +649,7 @@ export default function microsoftCalendar(rl: RunlinePluginAPI): void {
       const r = await graphRequest<{ id: string; webLink: string }>(
         ctx,
         NAME,
-        SCOPES,
+        WRITE_SCOPES,
         "PATCH",
         `${userBase(ctx)}/events/${encodeURIComponent(p.id)}`,
         toEvent(p),
@@ -476,7 +668,7 @@ export default function microsoftCalendar(rl: RunlinePluginAPI): void {
       return graphRequest(
         ctx,
         NAME,
-        SCOPES,
+        WRITE_SCOPES,
         "DELETE",
         `${userBase(ctx)}/events/${encodeURIComponent(p.id)}`,
       );
@@ -496,7 +688,7 @@ export default function microsoftCalendar(rl: RunlinePluginAPI): void {
       return graphRequest(
         ctx,
         NAME,
-        SCOPES,
+        WRITE_SCOPES,
         "POST",
         `${userBase(ctx)}/events/${encodeURIComponent(p.id)}/cancel`,
         p.comment === undefined ? {} : { comment: p.comment },
@@ -522,6 +714,22 @@ export default function microsoftCalendar(rl: RunlinePluginAPI): void {
         default: true,
         description: "Reply to the organizer",
       },
+      proposedStart: {
+        type: "string",
+        required: false,
+        description:
+          "decline or tentativelyAccept only: propose this start instead (ISO, same form as event.create)",
+      },
+      proposedEnd: {
+        type: "string",
+        required: false,
+        description: "End of the proposed time; given with proposedStart",
+      },
+      timeZone: {
+        type: "string",
+        required: false,
+        description: "Zone for proposedStart/End without an offset (default UTC)",
+      },
     },
     async execute(input, ctx: Ctx) {
       const p = input as {
@@ -529,19 +737,77 @@ export default function microsoftCalendar(rl: RunlinePluginAPI): void {
         response: string;
         comment?: string;
         sendResponse?: boolean;
+        proposedStart?: string;
+        proposedEnd?: string;
+        timeZone?: string;
       };
       if (!(RESPONSES as readonly string[]).includes(p.response))
         throw new Error(
           `${NAME}: response must be one of ${RESPONSES.join(", ")}`,
         );
+      const proposing =
+        p.proposedStart !== undefined || p.proposedEnd !== undefined;
+      if (proposing) {
+        if (p.proposedStart === undefined || p.proposedEnd === undefined)
+          throw new Error(
+            `${NAME}: proposedStart and proposedEnd must be given together`,
+          );
+        if (p.response === "accept")
+          throw new Error(
+            `${NAME}: a new time can be proposed only with decline or tentativelyAccept`,
+          );
+        if (p.sendResponse === false)
+          throw new Error(
+            `${NAME}: proposing a new time sends a response to the organizer`,
+          );
+      }
       return graphRequest(
         ctx,
         NAME,
-        SCOPES,
+        WRITE_SCOPES,
         "POST",
         `${userBase(ctx)}/events/${encodeURIComponent(p.id)}/${p.response}`,
         {
           sendResponse: p.sendResponse ?? true,
+          ...(p.comment === undefined ? {} : { comment: p.comment }),
+          ...(proposing
+            ? {
+                proposedNewTime: {
+                  start: dateTime(p.proposedStart as string, p.timeZone, false),
+                  end: dateTime(p.proposedEnd as string, p.timeZone, false),
+                },
+              }
+            : {}),
+        },
+      );
+    },
+  });
+
+  rl.registerAction("event.forward", {
+    access: "write",
+    description:
+      "Forward a meeting invitation to more people, with an optional comment. Returns {success}. Get user approval before forwarding.",
+    inputSchema: {
+      id: { type: "string", required: true },
+      to: {
+        type: "array",
+        required: true,
+        description: "Recipient address(es)",
+      },
+      comment: { type: "string", required: false },
+    },
+    async execute(input, ctx: Ctx) {
+      const p = input as { id: string; to: string[] | string; comment?: string };
+      if (!list(p.to).length)
+        throw new Error(`${NAME}: event.forward needs at least one recipient`);
+      return graphRequest(
+        ctx,
+        NAME,
+        WRITE_SCOPES,
+        "POST",
+        `${userBase(ctx)}/events/${encodeURIComponent(p.id)}/forward`,
+        {
+          toRecipients: recipients(p.to),
           ...(p.comment === undefined ? {} : { comment: p.comment }),
         },
       );

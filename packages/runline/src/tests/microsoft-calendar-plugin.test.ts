@@ -62,6 +62,8 @@ describe("microsoftCalendar", () => {
       "calendar.list": "read",
       "calendar.listCalendars": "read",
       "calendar.getSchedule": "read",
+      "calendar.findMeetingTimes": "read",
+      "event.list": "read",
       "event.get": "read",
       "event.listInstances": "read",
       "event.create": "write",
@@ -69,6 +71,7 @@ describe("microsoftCalendar", () => {
       "event.delete": "write",
       "event.cancel": "write",
       "event.respond": "write",
+      "event.forward": "write",
     });
   });
 
@@ -177,5 +180,124 @@ describe("microsoftCalendar", () => {
       endTime: { dateTime: "2026-05-01T17:00:00", timeZone: "Europe/London" },
       availabilityViewInterval: 30,
     });
+  });
+
+  it("suggests meeting times", async () => {
+    const seen = capture(() =>
+      Response.json({
+        meetingTimeSuggestions: [{ confidence: 100 }],
+        emptySuggestionsReason: "",
+      }),
+    );
+    const result = await run("calendar.findMeetingTimes", {
+      attendees: ["a@example.com"],
+      optionalAttendees: "b@example.com",
+      start: "2026-05-04T09:00:00Z",
+      end: "2026-05-08T17:00:00Z",
+      durationMinutes: 45,
+    });
+    assert.deepEqual(result, {
+      suggestions: [{ confidence: 100 }],
+      emptySuggestionsReason: undefined,
+    });
+    assert.ok(seen[0].url.endsWith("/me/findMeetingTimes"));
+    assert.deepEqual(seen[0].body, {
+      attendees: [
+        { emailAddress: { address: "a@example.com" }, type: "required" },
+        { emailAddress: { address: "b@example.com" }, type: "optional" },
+      ],
+      timeConstraint: {
+        activityDomain: "work",
+        timeSlots: [
+          {
+            start: { dateTime: "2026-05-04T09:00:00.000", timeZone: "UTC" },
+            end: { dateTime: "2026-05-08T17:00:00.000", timeZone: "UTC" },
+          },
+        ],
+      },
+      meetingDuration: "PT45M",
+      maxCandidates: 5,
+      returnSuggestionReasons: true,
+    });
+  });
+
+  it("finds events by filter, quoting literals", async () => {
+    const seen = capture(() => Response.json({ value: [{ id: "e1" }] }));
+    assert.deepEqual(
+      await run("event.list", {
+        subject: "Bob's 1:1",
+        organizer: "a@example.com",
+        modifiedSince: "2026-05-01T00:00:00Z",
+      }),
+      [{ id: "e1" }],
+    );
+    const url = new URL(seen[0].url);
+    assert.ok(url.pathname.endsWith("/me/events"));
+    assert.equal(
+      url.searchParams.get("$filter"),
+      "contains(subject,'Bob''s 1:1') and organizer/emailAddress/address eq 'a@example.com' and lastModifiedDateTime ge 2026-05-01T00:00:00.000Z",
+    );
+  });
+
+  it("forwards an invitation", async () => {
+    const seen = capture(() => new Response(null, { status: 202 }));
+    await run("event.forward", {
+      id: "e1",
+      to: "c@example.com",
+      comment: "fyi",
+    });
+    assert.ok(seen[0].url.endsWith("/me/events/e1/forward"));
+    assert.deepEqual(seen[0].body, {
+      toRecipients: [{ emailAddress: { address: "c@example.com" } }],
+      comment: "fyi",
+    });
+    await assert.rejects(
+      run("event.forward", { id: "e1", to: [] }),
+      /at least one recipient/,
+    );
+  });
+
+  it("proposes a new time only with decline or tentativelyAccept", async () => {
+    const seen = capture(() => new Response(null, { status: 202 }));
+    await run("event.respond", {
+      id: "e1",
+      response: "tentativelyAccept",
+      proposedStart: "2026-05-01T14:00:00",
+      proposedEnd: "2026-05-01T14:30:00",
+      timeZone: "Asia/Jerusalem",
+    });
+    assert.deepEqual(seen[0].body, {
+      sendResponse: true,
+      proposedNewTime: {
+        start: { dateTime: "2026-05-01T14:00:00", timeZone: "Asia/Jerusalem" },
+        end: { dateTime: "2026-05-01T14:30:00", timeZone: "Asia/Jerusalem" },
+      },
+    });
+    const times = {
+      proposedStart: "2026-05-01T14:00:00Z",
+      proposedEnd: "2026-05-01T14:30:00Z",
+    };
+    await assert.rejects(
+      run("event.respond", { id: "e1", response: "accept", ...times }),
+      /only with decline or tentativelyAccept/,
+    );
+    await assert.rejects(
+      run("event.respond", {
+        id: "e1",
+        response: "decline",
+        sendResponse: false,
+        ...times,
+      }),
+      /sends a response/,
+    );
+    await assert.rejects(
+      run("event.respond", {
+        id: "e1",
+        response: "decline",
+        proposedStart: times.proposedStart,
+      }),
+      /given together/,
+    );
+    assert.equal(seen.length, 1);
   });
 });
